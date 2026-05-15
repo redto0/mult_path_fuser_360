@@ -1,4 +1,4 @@
-An opinionated ROS2 C++ node template, optimised for ISC.
+named in honor of our cad prgram , fusion 360
 
 # Instructions
 
