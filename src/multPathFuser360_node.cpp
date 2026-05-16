@@ -7,6 +7,8 @@ mult_path_fuser_360::mult_path_fuser_360(const rclcpp::NodeOptions& options) : N
     // Parameters
     float x = this->declare_parameter<float>("foo", -10.0);
 
+    target_frame = this->declare_parameter<std::string>("target_frame", "rear_axle");
+
     this->path_gps_sub = this->create_subscription<nav_msgs::msg::Path>("/path_gps", 5);
 
     this->path_vision_sub = this->create_subscription<nav_msgs::msg::Path>("/path_vision", 5);
@@ -19,27 +21,55 @@ mult_path_fuser_360::mult_path_fuser_360(const rclcpp::NodeOptions& options) : N
 }
 
 // Store the latest GPS path
-void mult_path_fuser_360::gps_callback(const nav_msgs::msg::Path::SharedPtr msg) {
+void mult_path_fuser_360::path_gps_sub(const nav_msgs::msg::Path::SharedPtr msg) {
     // store the lastest gps_path
-    // note this only works because the GPS path is published at a lower rate than the other path! 
-    this->path_gps = *msg;
+    // note this only works because the GPS path is published at a lower rate than the other path!
+    std::lock_guard<std::mutex> lock(gps_path_mtx);
+    path_gps = *msg;
 }
-
+// Helper to compute 2D distance between poses
+double pose_distance(const geometry_msgs::msg::PoseStamped& a, const geometry_msgs::msg::PoseStamped& b) {
+    double dx = a.pose.position.x - b.pose.position.x;
+    double dy = a.pose.position.y - b.pose.position.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
 // Fuse paths: vision preferred, append extra GPS points if vision is shorter
-void mult_path_fuser_360::vision_callback(const nav_msgs::msg::Path::SharedPtr msg) {
-    nav_msgs::msg::Path fused_path = *msg;  // Start with vision path
+void mult_path_fuser_360::path_vision_sub(const nav_msgs::msg::Path::SharedPtr msg) {
+    transform_path(*msg, target_frame);
+    {
+        std::lock_guard<std::mutex> vision_lock(vision_path_mtx);
+        path_vision = *msg;  // Start with vision path
+    }
+    transform_path(path_vision, target_frame);
 
-    // Append any extra GPS points
-    if (!path_gps.poses.empty()) {
-        size_t vision_size = fused_path.poses.size();
-        size_t gps_size = path_gps.poses.size();
+    // Transform GPS path into vision frame
+    nav_msgs::msg::Path gps_transformed;
+    {
+        std::lock_guard<std::mutex> gps_lock(gps_path_mtx);
+        gps_transformed = path_gps;
+    }
+    transform_path(gps_transformed, target_frame);
 
-        if (gps_size > vision_size) {
-            // Append GPS points beyond the vision path
-            fused_path.poses.insert(fused_path.poses.end(), path_gps.poses.begin() + vision_size, path_gps.poses.end());
+    // Start fused path with vision
+    nav_msgs::msg::Path fused_path = path_vision;
+
+    // Distance threshold in meters
+    const double dist_thresh = 0.5;
+
+    if (!gps_transformed.poses.empty()) {
+        // Start from last vision point
+        geometry_msgs::msg::PoseStamped last_vision_pose = fused_path.poses.back();
+
+        for (const auto& gps_pose : gps_transformed.poses) {
+            if (pose_distance(last_vision_pose, gps_pose) > dist_thresh) {
+                fused_path.poses.push_back(gps_pose);
+                last_vision_pose = gps_pose;  // Update last point
+            }
         }
     }
 
-    // Publish fused path
+    // Update vision path with fused version for next iteration
+    path_vision = msg;
+
     combined_path_pub->publish(fused_path);
 }
